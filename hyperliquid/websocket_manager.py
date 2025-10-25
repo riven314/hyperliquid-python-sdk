@@ -194,13 +194,19 @@ class WebsocketManager(threading.Thread):
             return
 
         ws_msg: WsMsg = json.loads(message)
-        identifier = ws_msg_to_identifier(ws_msg)
 
-        if identifier == "error":
+        # check channel directly for proper type narrowing
+        if ws_msg["channel"] == "error":
             logging.error(f"Websocket received error message, stopping websocket: {ws_msg['data']}")
             self.stop()
             return
 
+        if ws_msg["channel"] == "subscriptionResponse":
+            logging.debug(f"Websocket received subscription response: {ws_msg['data']}")
+            return
+
+        # get identifier for remaining message types
+        identifier = ws_msg_to_identifier(ws_msg)
         if identifier == "pong":
             self.last_pong_time = time.time()  # update pong timestamp
             logging.debug("Websocket received pong")
@@ -209,6 +215,7 @@ class WebsocketManager(threading.Thread):
         if identifier is None:
             logging.debug(f"Websocket not handling unknown message: {ws_msg}")
             return
+
         active_subscriptions = self.active_subscriptions[identifier]
         if len(active_subscriptions) == 0:
             print("Websocket message from an unexpected subscription:", message, identifier)
