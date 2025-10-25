@@ -153,6 +153,8 @@ UserEventsData = TypedDict("UserEventsData", {"fills": List[Fill]}, total=False)
 UserEventsMsg = TypedDict("UserEventsMsg", {"channel": Literal["user"], "data": UserEventsData})
 UserFillsData = TypedDict("UserFillsData", {"user": str, "isSnapshot": bool, "fills": List[Fill]})
 UserFillsMsg = TypedDict("UserFillsMsg", {"channel": Literal["userFills"], "data": UserFillsData})
+SubscriptionResponseMsg = TypedDict("SubscriptionResponseMsg", {"channel": Literal["subscriptionResponse"], "data": Any})
+ErrorMsg = TypedDict("ErrorMsg", {"channel": Literal["error"], "data": str})
 OtherWsMsg = TypedDict(
     "OtherWsMsg",
     {
@@ -175,6 +177,8 @@ WsMsg = Union[
     UserEventsMsg,
     PongMsg,
     UserFillsMsg,
+    SubscriptionResponseMsg,
+    ErrorMsg,
     OtherWsMsg,
     ActiveAssetCtxMsg,
     ActiveSpotAssetCtxMsg,

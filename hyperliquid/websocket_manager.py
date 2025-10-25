@@ -48,7 +48,11 @@ def subscription_to_identifier(subscription: Subscription) -> str:
 
 
 def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
-    if ws_msg["channel"] == "pong":
+    if ws_msg["channel"] == "subscriptionResponse":
+        return "subscriptionResponse"
+    elif ws_msg["channel"] == "error":
+        return "error"
+    elif ws_msg["channel"] == "pong":
         return "pong"
     elif ws_msg["channel"] == "allMids":
         return "allMids"
@@ -188,15 +192,22 @@ class WebsocketManager(threading.Thread):
         if message == "Websocket connection established.":
             logging.debug(message)
             return
-        logging.debug(f"on_message {message}")
+
         ws_msg: WsMsg = json.loads(message)
         identifier = ws_msg_to_identifier(ws_msg)
+
+        if identifier == "error":
+            logging.error(f"Websocket received error message, stopping websocket: {ws_msg['data']}")
+            self.stop()
+            return
+
         if identifier == "pong":
             self.last_pong_time = time.time()  # update pong timestamp
             logging.debug("Websocket received pong")
             return
+
         if identifier is None:
-            logging.debug("Websocket not handling empty message")
+            logging.debug(f"Websocket not handling unknown message: {ws_msg}")
             return
         active_subscriptions = self.active_subscriptions[identifier]
         if len(active_subscriptions) == 0:
