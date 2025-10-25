@@ -1,13 +1,21 @@
 import json
 import logging
 import threading
+import time
 from collections import defaultdict
 
 import websocket
 
 from hyperliquid.utils.types import Any, Callable, Dict, List, NamedTuple, Optional, Subscription, Tuple, WsMsg
 
-ActiveSubscription = NamedTuple("ActiveSubscription", [("callback", Callable[[Any], None]), ("subscription_id", int)])
+ActiveSubscription = NamedTuple(
+    "ActiveSubscription",
+    [
+        ("callback", Callable[[Any], None]),
+        ("subscription_id", int),
+        ("subscription", Subscription),  # store original subscription for reconnection
+    ],
+)
 
 
 def subscription_to_identifier(subscription: Subscription) -> str:
@@ -75,27 +83,99 @@ def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
 
 
 class WebsocketManager(threading.Thread):
-    def __init__(self, base_url):
+    def __init__(
+        self,
+        base_url: str,
+        reconnect_enabled: bool = True,
+        max_reconnect_delay: int = 30,
+        pong_timeout: float = 90.0,
+    ):
         super().__init__()
         self.subscription_id_counter = 0
         self.ws_ready = False
         self.queued_subscriptions: List[Tuple[Subscription, ActiveSubscription]] = []
         self.active_subscriptions: Dict[str, List[ActiveSubscription]] = defaultdict(list)
+
+        # reconnection configuration
+        self.reconnect_enabled = reconnect_enabled
+        self.max_reconnect_delay = max_reconnect_delay
+        self.reconnect_attempts = 0
+
+        # pong timeout configuration
+        self.pong_timeout = pong_timeout
+        self.last_pong_time = time.time()
+
         ws_url = "ws" + base_url[len("http") :] + "/ws"
-        self.ws = websocket.WebSocketApp(ws_url, on_message=self.on_message, on_open=self.on_open)
+        self.ws = websocket.WebSocketApp(
+            ws_url, on_message=self.on_message, on_open=self.on_open, on_error=self.on_error, on_close=self.on_close
+        )
         self.ping_sender = threading.Thread(target=self.send_ping)
         self.stop_event = threading.Event()
 
+    def on_error(self, ws, error):
+        logging.error(f"WebSocket error: {error}")
+
+    def on_close(self, ws, close_status_code, close_msg):
+        logging.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        self.ws_ready = False
+
     def run(self):
         self.ping_sender.start()
-        self.ws.run_forever()
+
+        while not self.stop_event.is_set():
+            try:
+                self.ws.run_forever()
+
+                # connection closed - check if we should reconnect
+                if self.stop_event.is_set() or not self.reconnect_enabled:
+                    break
+
+                # calculate exponential backoff delay
+                delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+                self.reconnect_attempts += 1
+
+                logging.info(f"Reconnecting in {delay}s (attempt {self.reconnect_attempts})...")
+
+                # wait with backoff (interruptible by stop_event)
+                if self.stop_event.wait(delay):
+                    break
+
+                # loop continues, ws.run_forever() will reconnect
+
+            except Exception as e:
+                logging.error(f"WebSocket unexpected error: {e}")
+                if not self.stop_event.is_set() and self.reconnect_enabled:
+                    # calculate exponential backoff delay
+                    delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+                    self.reconnect_attempts += 1
+
+                    logging.info(f"Reconnecting after error in {delay}s (attempt {self.reconnect_attempts})...")
+
+                    if self.stop_event.wait(delay):
+                        break
+                    continue
+                break
 
     def send_ping(self):
         while not self.stop_event.wait(50):
             if not self.ws.keep_running:
                 break
-            logging.debug("Websocket sending ping")
-            self.ws.send(json.dumps({"method": "ping"}))
+
+            # check pong timeout
+            time_since_pong = time.time() - self.last_pong_time
+            if time_since_pong > self.pong_timeout:
+                logging.error(f"Pong timeout - no response for {time_since_pong:.1f}s")
+                self.ws.close()  # trigger reconnection via run()
+                break
+
+            # send ping
+            try:
+                logging.debug("Websocket sending ping")
+                self.ws.send(json.dumps({"method": "ping"}))
+            except Exception as e:
+                logging.error(f"Failed to send ping: {e}")
+                break
+
         logging.debug("Websocket ping sender stopped")
 
     def stop(self):
@@ -112,6 +192,7 @@ class WebsocketManager(threading.Thread):
         ws_msg: WsMsg = json.loads(message)
         identifier = ws_msg_to_identifier(ws_msg)
         if identifier == "pong":
+            self.last_pong_time = time.time()  # update pong timestamp
             logging.debug("Websocket received pong")
             return
         if identifier is None:
@@ -127,8 +208,38 @@ class WebsocketManager(threading.Thread):
     def on_open(self, _ws):
         logging.debug("on_open")
         self.ws_ready = True
+        self.last_pong_time = time.time()  # reset pong timer on new connection
+
+        # on reconnection, restore active subscriptions
+        if self.reconnect_attempts > 0:
+            logging.info(f"Reconnected successfully after {self.reconnect_attempts} attempts")
+
+            # collect all active subscriptions to restore
+            subscriptions_to_restore = []
+
+            # save current active subscriptions and clear them
+            temp_active_subs = dict(self.active_subscriptions)
+            self.active_subscriptions.clear()
+
+            # re-subscribe to all previously active subscriptions
+            for identifier, active_subs in temp_active_subs.items():
+                for active_sub in active_subs:
+                    subscriptions_to_restore.append(active_sub)
+
+            # restore all subscriptions
+            for active_sub in subscriptions_to_restore:
+                self.subscribe(active_sub.subscription, active_sub.callback, active_sub.subscription_id)
+
+            logging.info(f"Restored {len(subscriptions_to_restore)} subscriptions after reconnection")
+
+        # reset reconnection counter on successful connection
+        self.reconnect_attempts = 0
+
+        # process queued subscriptions (for initial connection or new subscriptions during disconnect)
         for subscription, active_subscription in self.queued_subscriptions:
             self.subscribe(subscription, active_subscription.callback, active_subscription.subscription_id)
+
+        self.queued_subscriptions.clear()
 
     def subscribe(
         self, subscription: Subscription, callback: Callable[[Any], None], subscription_id: Optional[int] = None
@@ -138,7 +249,9 @@ class WebsocketManager(threading.Thread):
             subscription_id = self.subscription_id_counter
         if not self.ws_ready:
             logging.debug("enqueueing subscription")
-            self.queued_subscriptions.append((subscription, ActiveSubscription(callback, subscription_id)))
+            self.queued_subscriptions.append(
+                (subscription, ActiveSubscription(callback, subscription_id, subscription))
+            )
         else:
             logging.debug("subscribing")
             identifier = subscription_to_identifier(subscription)
@@ -146,7 +259,7 @@ class WebsocketManager(threading.Thread):
                 # TODO: ideally the userEvent and orderUpdates messages would include the user so that we can multiplex
                 if len(self.active_subscriptions[identifier]) != 0:
                     raise NotImplementedError(f"Cannot subscribe to {identifier} multiple times")
-            self.active_subscriptions[identifier].append(ActiveSubscription(callback, subscription_id))
+            self.active_subscriptions[identifier].append(ActiveSubscription(callback, subscription_id, subscription))
             self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
         return subscription_id
 
