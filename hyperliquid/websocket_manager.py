@@ -124,6 +124,7 @@ class WebsocketManager(threading.Thread):
         self.ws_ready = False
 
     def run(self):
+        logging.info("running WebsocketManager")
         self.ping_sender.start()
 
         while not self.stop_event.is_set():
