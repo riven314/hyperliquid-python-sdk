@@ -113,7 +113,7 @@ class WebsocketManager(threading.Thread):
         self.ws = websocket.WebSocketApp(
             ws_url, on_message=self.on_message, on_open=self.on_open, on_error=self.on_error, on_close=self.on_close
         )
-        self.ping_sender = threading.Thread(target=self.send_ping)
+        self.ping_sender: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
 
     def on_error(self, ws, error):
@@ -125,7 +125,7 @@ class WebsocketManager(threading.Thread):
 
     def run(self):
         logging.info("running WebsocketManager")
-        self.ping_sender.start()
+        self._start_ping_thread()
 
         while not self.stop_event.is_set():
             try:
@@ -162,16 +162,17 @@ class WebsocketManager(threading.Thread):
                 break
 
     def send_ping(self):
+        logging.info("Websocket ping loop running")
         while not self.stop_event.wait(50):
             if not self.ws.keep_running:
-                break
+                continue
 
             # check pong timeout
             time_since_pong = time.time() - self.last_pong_time
             if time_since_pong > self.pong_timeout:
-                logging.error(f"Pong timeout - no response for {time_since_pong:.1f}s")
+                logging.error(f"Pong timeout - no response for {time_since_pong:.1f}s; closing socket")
                 self.ws.close()  # trigger reconnection via run()
-                break
+                continue
 
             # send ping
             try:
@@ -179,14 +180,14 @@ class WebsocketManager(threading.Thread):
                 self.ws.send(json.dumps({"method": "ping"}))
             except Exception as e:
                 logging.error(f"Failed to send ping: {e}")
-                break
+                continue
 
-        logging.debug("Websocket ping sender stopped")
+        logging.info("Websocket ping thread stopped")
 
     def stop(self):
         self.stop_event.set()
         self.ws.close()
-        if self.ping_sender.is_alive():
+        if self.ping_sender is not None and self.ping_sender.is_alive():
             self.ping_sender.join()
 
     def on_message(self, _ws, message):
@@ -228,6 +229,9 @@ class WebsocketManager(threading.Thread):
         logging.debug("on_open")
         self.ws_ready = True
         self.last_pong_time = time.time()  # reset pong timer on new connection
+        if self.ping_sender is None or not self.ping_sender.is_alive():
+            self._start_ping_thread()
+            logging.info("Restarted ping thread after reconnect")
 
         # on reconnection, restore active subscriptions
         if self.reconnect_attempts > 0:
@@ -259,6 +263,12 @@ class WebsocketManager(threading.Thread):
             self.subscribe(subscription, active_subscription.callback, active_subscription.subscription_id)
 
         self.queued_subscriptions.clear()
+
+    def _start_ping_thread(self):
+        if self.ping_sender is not None and self.ping_sender.is_alive():
+            return
+        self.ping_sender = threading.Thread(target=self.send_ping, name="HyperliquidPing", daemon=True)
+        self.ping_sender.start()
 
     def subscribe(
         self, subscription: Subscription, callback: Callable[[Any], None], subscription_id: Optional[int] = None
