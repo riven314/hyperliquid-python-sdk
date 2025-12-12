@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import threading
 import time
 from collections import defaultdict
@@ -95,6 +96,9 @@ class WebsocketManager(threading.Thread):
         pong_timeout: float = 90.0,
     ):
         super().__init__()
+        # stable identifier for log correlation across long-running processes
+        self.instance_id = f"{random.getrandbits(24):06x}"
+        self.connection_epoch = 0
         self.subscription_id_counter = 0
         self.ws_ready = False
         self.queued_subscriptions: List[Tuple[Subscription, ActiveSubscription]] = []
@@ -108,6 +112,7 @@ class WebsocketManager(threading.Thread):
         # pong timeout configuration
         self.pong_timeout = pong_timeout
         self.last_pong_time = time.time()
+        self.heartbeat_interval = 30  # seconds
 
         ws_url = "ws" + base_url[len("http") :] + "/ws"
         self.ws = websocket.WebSocketApp(
@@ -116,15 +121,43 @@ class WebsocketManager(threading.Thread):
         self.ping_sender: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
 
+    @property
+    def log_prefix(self) -> str:
+        return f"[ws:{self.instance_id} e:{self.connection_epoch}]"
+
+    def _send_heartbeat_once(self, context: str) -> None:
+        """Send one heartbeat immediately (best-effort)."""
+        if not self.ws.keep_running:
+            logging.info(f"{self.log_prefix} HEARTBEAT_SKIPPED self.ws.keep_running=False context={context}")
+            return
+        try:
+            self.ws.send(json.dumps({"method": "ping"}))
+            logging.info(f"{self.log_prefix} HEARTBEAT_SENT context={context}")
+        except Exception as e:
+            logging.error(f"{self.log_prefix} HEARTBEAT_SEND_FAILED context={context} error={e}")
+
     def on_error(self, ws, error):
-        logging.error(f"WebSocket error: {error}")
+        err_str = str(error)
+        if "Inactive" in err_str:
+            logging.error(
+                f"{self.log_prefix} WS_INACTIVE_SIGNAL error={err_str} last_pong_age_s={time.time() - self.last_pong_time:.1f}"
+            )
+        logging.error(f"{self.log_prefix} WebSocket error: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
-        logging.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        close_msg_str = "" if close_msg is None else str(close_msg)
+        if "Inactive" in close_msg_str:
+            logging.error(
+                f"{self.log_prefix} WS_CLOSED_INACTIVE code={close_status_code} msg={close_msg_str} last_pong_age_s={time.time() - self.last_pong_time:.1f}"
+            )
+        logging.info(f"{self.log_prefix} WebSocket closed: {close_status_code} - {close_msg}")
         self.ws_ready = False
 
     def run(self):
-        logging.info("running WebsocketManager")
+        logging.info(
+            f"{self.log_prefix} running WebsocketManager reconnect_enabled={self.reconnect_enabled} max_reconnect_delay={self.max_reconnect_delay} "
+            f"pong_timeout={self.pong_timeout} heartbeat_interval={self.heartbeat_interval}"
+        )
         self._start_ping_thread()
 
         while not self.stop_event.is_set():
@@ -135,11 +168,14 @@ class WebsocketManager(threading.Thread):
                 if self.stop_event.is_set() or not self.reconnect_enabled:
                     break
 
-                # calculate exponential backoff delay
-                delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+                # calculate exponential backoff delay, apply full jitter to de-synchronize retries
+                base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+                delay = random.uniform(1.0, base_delay)
                 self.reconnect_attempts += 1
 
-                logging.info(f"Reconnecting in {delay}s (attempt {self.reconnect_attempts})...")
+                logging.info(
+                    f"{self.log_prefix} Reconnecting in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
+                )
 
                 # wait with backoff (interruptible by stop_event)
                 if self.stop_event.wait(delay):
@@ -148,13 +184,16 @@ class WebsocketManager(threading.Thread):
                 # loop continues, ws.run_forever() will reconnect
 
             except Exception as e:
-                logging.error(f"WebSocket unexpected error: {e}")
+                logging.error(f"{self.log_prefix} WebSocket unexpected error: {e}")
                 if not self.stop_event.is_set() and self.reconnect_enabled:
-                    # calculate exponential backoff delay
-                    delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+                    # calculate exponential backoff delay, apply full jitter to de-synchronize retries
+                    base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+                    delay = random.uniform(1.0, base_delay)
                     self.reconnect_attempts += 1
 
-                    logging.info(f"Reconnecting after error in {delay}s (attempt {self.reconnect_attempts})...")
+                    logging.info(
+                        f"{self.log_prefix} Reconnecting after error in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
+                    )
 
                     if self.stop_event.wait(delay):
                         break
@@ -162,27 +201,24 @@ class WebsocketManager(threading.Thread):
                 break
 
     def send_ping(self):
-        logging.info("Websocket ping loop running")
-        while not self.stop_event.wait(50):
+        logging.info(f"{self.log_prefix} Websocket ping loop running interval={self.heartbeat_interval}s")
+        while not self.stop_event.wait(self.heartbeat_interval):
             if not self.ws.keep_running:
                 continue
 
             # check pong timeout
             time_since_pong = time.time() - self.last_pong_time
             if time_since_pong > self.pong_timeout:
-                logging.error(f"Pong timeout - no response for {time_since_pong:.1f}s; closing socket")
+                logging.error(
+                    f"{self.log_prefix} Pong timeout - no response for {time_since_pong:.1f}s; closing socket"
+                )
                 self.ws.close()  # trigger reconnection via run()
                 continue
 
-            # send ping
-            try:
-                logging.debug("Websocket sending ping")
-                self.ws.send(json.dumps({"method": "ping"}))
-            except Exception as e:
-                logging.error(f"Failed to send ping: {e}")
-                continue
+            # send heartbeat (same payload as immediate heartbeat)
+            self._send_heartbeat_once(context="interval")
 
-        logging.info("Websocket ping thread stopped")
+        logging.info(f"{self.log_prefix} Websocket ping thread stopped")
 
     def stop(self):
         self.stop_event.set()
@@ -226,16 +262,20 @@ class WebsocketManager(threading.Thread):
                 active_subscription.callback(ws_msg)
 
     def on_open(self, _ws):
-        logging.debug("on_open")
+        self.connection_epoch += 1
+        logging.info(f"{self.log_prefix} on_open")
         self.ws_ready = True
         self.last_pong_time = time.time()  # reset pong timer on new connection
         if self.ping_sender is None or not self.ping_sender.is_alive():
             self._start_ping_thread()
-            logging.info("Restarted ping thread after reconnect")
+            logging.info(f"{self.log_prefix} Restarted ping thread after reconnect")
+
+        # send an immediate heartbeat on every successful open/reconnect
+        self._send_heartbeat_once(context="on_open")
 
         # on reconnection, restore active subscriptions
         if self.reconnect_attempts > 0:
-            logging.info(f"Reconnected successfully after {self.reconnect_attempts} attempts")
+            logging.info(f"{self.log_prefix} Reconnected successfully after {self.reconnect_attempts} attempts")
 
             # collect all active subscriptions to restore
             subscriptions_to_restore = []
@@ -253,7 +293,7 @@ class WebsocketManager(threading.Thread):
             for active_sub in subscriptions_to_restore:
                 self.subscribe(active_sub.subscription, active_sub.callback, active_sub.subscription_id)
 
-            logging.info(f"Restored {len(subscriptions_to_restore)} subscriptions after reconnection")
+            logging.info(f"{self.log_prefix} Restored {len(subscriptions_to_restore)} subscriptions after reconnection")
 
         # reset reconnection counter on successful connection
         self.reconnect_attempts = 0
