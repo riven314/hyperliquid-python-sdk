@@ -128,11 +128,11 @@ class WebsocketManager(threading.Thread):
     def _send_heartbeat_once(self, context: str) -> None:
         """Send one heartbeat immediately (best-effort)."""
         if not self.ws.keep_running:
-            logging.info(f"{self.log_prefix} HEARTBEAT_SKIPPED self.ws.keep_running=False context={context}")
+            logging.debug(f"{self.log_prefix} HEARTBEAT_SKIPPED self.ws.keep_running=False context={context}")
             return
         try:
             self.ws.send(json.dumps({"method": "ping"}))
-            logging.info(f"{self.log_prefix} HEARTBEAT_SENT context={context}")
+            logging.debug(f"{self.log_prefix} HEARTBEAT_SENT context={context}")
         except Exception as e:
             logging.error(f"{self.log_prefix} HEARTBEAT_SEND_FAILED context={context} error={e}")
 
@@ -170,7 +170,7 @@ class WebsocketManager(threading.Thread):
 
                 # calculate exponential backoff delay, apply full jitter to de-synchronize retries
                 base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
-                delay = random.uniform(1.0, base_delay)
+                delay = random.uniform(0.0, base_delay)
                 self.reconnect_attempts += 1
 
                 logging.info(
@@ -188,7 +188,7 @@ class WebsocketManager(threading.Thread):
                 if not self.stop_event.is_set() and self.reconnect_enabled:
                     # calculate exponential backoff delay, apply full jitter to de-synchronize retries
                     base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
-                    delay = random.uniform(1.0, base_delay)
+                    delay = random.uniform(0.0, base_delay)
                     self.reconnect_attempts += 1
 
                     logging.info(
