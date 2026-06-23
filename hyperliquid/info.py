@@ -1,3 +1,5 @@
+import logging
+
 from hyperliquid.api import API
 from hyperliquid.utils.types import (
     Any,
@@ -40,17 +42,31 @@ class Info(API):
         self.asset_to_sz_decimals = {}
 
         # spot assets start at 10000
+        num_tokens = len(spot_meta["tokens"])
+        skipped_spot: list[str] = []
         for spot_info in spot_meta["universe"]:
+            base, quote = spot_info["tokens"]
+            # hyperliquid returns non-canonical spot entries whose token indices
+            # exceed the tokens list (e.g. @367 -> base_idx=479 with only 467 tokens).
+            # skip them rather than indexing out of range.
+            if base >= num_tokens or quote >= num_tokens:
+                skipped_spot.append(f"{spot_info['name']}(tokens={spot_info['tokens']})")
+                continue
             asset = spot_info["index"] + 10000
             self.coin_to_asset[spot_info["name"]] = asset
             self.name_to_coin[spot_info["name"]] = spot_info["name"]
-            base, quote = spot_info["tokens"]
             base_info = spot_meta["tokens"][base]
             quote_info = spot_meta["tokens"][quote]
             self.asset_to_sz_decimals[asset] = base_info["szDecimals"]
             name = f'{base_info["name"]}/{quote_info["name"]}'
             if name not in self.name_to_coin:
                 self.name_to_coin[name] = spot_info["name"]
+
+        if skipped_spot:
+            logging.warning(
+                f"Skipped {len(skipped_spot)} non-canonical spot markets with out-of-range token indices: "
+                f"{', '.join(skipped_spot)}"
+            )
 
         perp_dex_to_offset = {"": 0}
         if perp_dexs is None:
