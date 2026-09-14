@@ -239,8 +239,8 @@ class WebsocketManager(threading.Thread):
 
         # check channel directly for proper type narrowing
         if ws_msg["channel"] == "error":
-            logging.error(f"Websocket received error message, stopping websocket: {ws_msg['data']}")
-            self.stop()
+            # server errors are scoped to one request (e.g. a rejected subscription), so keep the other streams alive
+            logging.error(f"{self.log_prefix} Websocket received error message: {ws_msg['data']}")
             return
 
         if ws_msg["channel"] == "subscriptionResponse":
@@ -332,8 +332,11 @@ class WebsocketManager(threading.Thread):
                 # TODO: ideally the userEvent and orderUpdates messages would include the user so that we can multiplex
                 if len(self.active_subscriptions[identifier]) != 0:
                     raise NotImplementedError(f"Cannot subscribe to {identifier} multiple times")
+            is_first_for_identifier = len(self.active_subscriptions[identifier]) == 0
             self.active_subscriptions[identifier].append(ActiveSubscription(callback, subscription_id, subscription))
-            self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
+            # the server rejects a repeated subscribe to the same channel, so extra callbacks fan out locally
+            if is_first_for_identifier:
+                self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
         return subscription_id
 
     def unsubscribe(self, subscription: Subscription, subscription_id: int) -> bool:
