@@ -42,21 +42,20 @@ class Info(API):
         self.asset_to_sz_decimals = {}
 
         # spot assets start at 10000
-        num_tokens = len(spot_meta["tokens"])
+        # spot universe entries reference tokens by their "index" field, not list position:
+        # the tokens list has gaps (e.g. position 458 holds index 478), so positional lookup picks the wrong token
+        token_by_index = {token["index"]: token for token in spot_meta["tokens"]}
         skipped_spot: list[str] = []
         for spot_info in spot_meta["universe"]:
             base, quote = spot_info["tokens"]
-            # hyperliquid returns non-canonical spot entries whose token indices
-            # exceed the tokens list (e.g. @367 -> base_idx=479 with only 467 tokens).
-            # skip them rather than indexing out of range.
-            if base >= num_tokens or quote >= num_tokens:
+            if base not in token_by_index or quote not in token_by_index:
                 skipped_spot.append(f"{spot_info['name']}(tokens={spot_info['tokens']})")
                 continue
             asset = spot_info["index"] + 10000
             self.coin_to_asset[spot_info["name"]] = asset
             self.name_to_coin[spot_info["name"]] = spot_info["name"]
-            base_info = spot_meta["tokens"][base]
-            quote_info = spot_meta["tokens"][quote]
+            base_info = token_by_index[base]
+            quote_info = token_by_index[quote]
             self.asset_to_sz_decimals[asset] = base_info["szDecimals"]
             name = f'{base_info["name"]}/{quote_info["name"]}'
             if name not in self.name_to_coin:
@@ -64,7 +63,7 @@ class Info(API):
 
         if skipped_spot:
             logging.warning(
-                f"Skipped {len(skipped_spot)} non-canonical spot markets with out-of-range token indices: "
+                f"Skipped {len(skipped_spot)} spot markets referencing unknown token indices: "
                 f"{', '.join(skipped_spot)}"
             )
 

@@ -7,14 +7,15 @@ from collections import defaultdict
 
 import websocket
 
-from hyperliquid.utils.types import Any, Callable, Dict, List, NamedTuple, Optional, Subscription, Tuple, WsMsg
+from hyperliquid.utils.types import Any, Callable, Dict, List, NamedTuple, Optional, Subscription, WsMsg
 
 ActiveSubscription = NamedTuple(
     "ActiveSubscription",
     [
         ("callback", Callable[[Any], None]),
         ("subscription_id", int),
-        ("subscription", Subscription),  # store original subscription for reconnection
+        # original subscription, replayed on reconnect
+        ("subscription", Subscription),
     ],
 )
 
@@ -30,6 +31,8 @@ def subscription_to_identifier(subscription: Subscription) -> str:
         return "userEvents"
     elif subscription["type"] == "userFills":
         return f'userFills:{subscription["user"].lower()}'
+    elif subscription["type"] == "userTwapSliceFills":
+        return f'userTwapSliceFills:{subscription["user"].lower()}'
     elif subscription["type"] == "candle":
         return f'candle:{subscription["coin"].lower()},{subscription["interval"]}'
     elif subscription["type"] == "orderUpdates":
@@ -49,11 +52,7 @@ def subscription_to_identifier(subscription: Subscription) -> str:
 
 
 def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
-    if ws_msg["channel"] == "subscriptionResponse":
-        return "subscriptionResponse"
-    elif ws_msg["channel"] == "error":
-        return "error"
-    elif ws_msg["channel"] == "pong":
+    if ws_msg["channel"] == "pong":
         return "pong"
     elif ws_msg["channel"] == "allMids":
         return "allMids"
@@ -69,6 +68,8 @@ def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
         return "userEvents"
     elif ws_msg["channel"] == "userFills":
         return f'userFills:{ws_msg["data"]["user"].lower()}'
+    elif ws_msg["channel"] == "userTwapSliceFills":
+        return f'userTwapSliceFills:{ws_msg["data"]["user"].lower()}'
     elif ws_msg["channel"] == "candle":
         return f'candle:{ws_msg["data"]["s"].lower()},{ws_msg["data"]["i"]}'
     elif ws_msg["channel"] == "orderUpdates":
@@ -85,24 +86,30 @@ def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
         return f'activeAssetCtx:{ws_msg["data"]["coin"].lower()}'
     elif ws_msg["channel"] == "activeAssetData":
         return f'activeAssetData:{ws_msg["data"]["coin"].lower()},{ws_msg["data"]["user"].lower()}'
+    return None
 
 
-class WebsocketManager(threading.Thread):
+class WebsocketManager(threading.Thread):  # pylint: disable=too-many-instance-attributes
+    # seconds between heartbeats, well inside the server's 60s idle timeout
+    heartbeat_interval = 30
+
     def __init__(
         self,
         base_url: str,
         reconnect_enabled: bool = True,
         max_reconnect_delay: int = 30,
         pong_timeout: float = 90.0,
-    ):
+    ) -> None:
         super().__init__()
         # stable identifier for log correlation across long-running processes
         self.instance_id = f"{random.getrandbits(24):06x}"
         self.connection_epoch = 0
         self.subscription_id_counter = 0
         self.ws_ready = False
-        self.queued_subscriptions: List[Tuple[Subscription, ActiveSubscription]] = []
+        self.queued_subscriptions: List[ActiveSubscription] = []
         self.active_subscriptions: Dict[str, List[ActiveSubscription]] = defaultdict(list)
+        # guards ws_ready and both subscription collections, which the socket thread and callers mutate concurrently
+        self.subscriptions_lock = threading.Lock()
 
         # reconnection configuration
         self.reconnect_enabled = reconnect_enabled
@@ -112,7 +119,6 @@ class WebsocketManager(threading.Thread):
         # pong timeout configuration
         self.pong_timeout = pong_timeout
         self.last_pong_time = time.time()
-        self.heartbeat_interval = 30  # seconds
 
         ws_url = "ws" + base_url[len("http") :] + "/ws"
         self.ws = websocket.WebSocketApp(
@@ -126,81 +132,69 @@ class WebsocketManager(threading.Thread):
         return f"[ws:{self.instance_id} e:{self.connection_epoch}]"
 
     def _send_heartbeat_once(self, context: str) -> None:
-        """Send one heartbeat immediately (best-effort)."""
         if not self.ws.keep_running:
             logging.debug(f"{self.log_prefix} HEARTBEAT_SKIPPED self.ws.keep_running=False context={context}")
             return
         try:
             self.ws.send(json.dumps({"method": "ping"}))
             logging.debug(f"{self.log_prefix} HEARTBEAT_SENT context={context}")
-        except Exception as e:
-            logging.error(f"{self.log_prefix} HEARTBEAT_SEND_FAILED context={context} error={e}")
+        except Exception:  # pylint: disable=broad-exception-caught
+            logging.exception(f"{self.log_prefix} HEARTBEAT_SEND_FAILED context={context}")
 
-    def on_error(self, ws, error):
-        err_str = str(error)
-        if "Inactive" in err_str:
+    def on_error(self, _ws: websocket.WebSocket, error: Exception) -> None:
+        # "Inactive" marks a server-side idle disconnect, tagged separately so heartbeat gaps stay greppable
+        if "Inactive" in str(error):
             logging.error(
-                f"{self.log_prefix} WS_INACTIVE_SIGNAL error={err_str} last_pong_age_s={time.time() - self.last_pong_time:.1f}"
+                f"{self.log_prefix} WS_INACTIVE_SIGNAL error={error} last_pong_age_s={time.time() - self.last_pong_time:.1f}"
             )
-        logging.error(f"{self.log_prefix} WebSocket error: {error}")
+            return
+        logging.error(f"{self.log_prefix} WebSocket error: {error}", exc_info=error)
 
-    def on_close(self, ws, close_status_code, close_msg):
-        close_msg_str = "" if close_msg is None else str(close_msg)
-        if "Inactive" in close_msg_str:
+    def on_close(self, _ws: websocket.WebSocket, close_status_code: Optional[int], close_msg: Optional[str]) -> None:
+        if close_msg is not None and "Inactive" in close_msg:
             logging.error(
-                f"{self.log_prefix} WS_CLOSED_INACTIVE code={close_status_code} msg={close_msg_str} last_pong_age_s={time.time() - self.last_pong_time:.1f}"
+                f"{self.log_prefix} WS_CLOSED_INACTIVE code={close_status_code} msg={close_msg} last_pong_age_s={time.time() - self.last_pong_time:.1f}"
             )
-        logging.info(f"{self.log_prefix} WebSocket closed: {close_status_code} - {close_msg}")
-        self.ws_ready = False
+        else:
+            logging.info(f"{self.log_prefix} WebSocket closed: {close_status_code} - {close_msg}")
+        with self.subscriptions_lock:
+            self.ws_ready = False
 
-    def run(self):
+    def run(self) -> None:
         logging.info(
-            f"{self.log_prefix} running WebsocketManager reconnect_enabled={self.reconnect_enabled} max_reconnect_delay={self.max_reconnect_delay} "
+            f"{self.log_prefix} Running WebsocketManager reconnect_enabled={self.reconnect_enabled} max_reconnect_delay={self.max_reconnect_delay} "
             f"pong_timeout={self.pong_timeout} heartbeat_interval={self.heartbeat_interval}"
         )
         self._start_ping_thread()
 
         while not self.stop_event.is_set():
+            # restart the pong window per attempt, else a stale one lets the ping thread close the socket mid-handshake
+            self.last_pong_time = time.time()
             try:
                 self.ws.run_forever()
+            except Exception:  # pylint: disable=broad-exception-caught
+                logging.exception(f"{self.log_prefix} WebSocket run_forever raised unexpectedly.")
 
-                # connection closed - check if we should reconnect
-                if self.stop_event.is_set() or not self.reconnect_enabled:
-                    break
-
-                # calculate exponential backoff delay, apply full jitter to de-synchronize retries
-                base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
-                delay = random.uniform(0.0, base_delay)
-                self.reconnect_attempts += 1
-
-                logging.info(
-                    f"{self.log_prefix} Reconnecting in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
-                )
-
-                # wait with backoff (interruptible by stop_event)
-                if self.stop_event.wait(delay):
-                    break
-
-                # loop continues, ws.run_forever() will reconnect
-
-            except Exception as e:
-                logging.error(f"{self.log_prefix} WebSocket unexpected error: {e}")
-                if not self.stop_event.is_set() and self.reconnect_enabled:
-                    # calculate exponential backoff delay, apply full jitter to de-synchronize retries
-                    base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
-                    delay = random.uniform(0.0, base_delay)
-                    self.reconnect_attempts += 1
-
-                    logging.info(
-                        f"{self.log_prefix} Reconnecting after error in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
-                    )
-
-                    if self.stop_event.wait(delay):
-                        break
-                    continue
+            if self.stop_event.is_set() or not self.reconnect_enabled:
+                break
+            if self._wait_before_reconnect():
                 break
 
-    def send_ping(self):
+    def _wait_before_reconnect(self) -> bool:
+        """
+        Sleeps with exponential backoff and full jitter, returning True if stop was requested meanwhile.
+
+        e.g. max_reconnect_delay=30: attempt 0 waits U(0, 1)s, attempt 3 waits U(0, 8)s, attempt 5+ waits U(0, 30)s.
+        """
+        base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+        delay = random.uniform(0.0, base_delay)  # nosec B311
+        self.reconnect_attempts += 1
+        logging.info(
+            f"{self.log_prefix} Reconnecting in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
+        )
+        return self.stop_event.wait(delay)
+
+    def send_ping(self) -> None:
         logging.info(f"{self.log_prefix} Websocket ping loop running interval={self.heartbeat_interval}s")
         while not self.stop_event.wait(self.heartbeat_interval):
             if not self.ws.keep_running:
@@ -212,7 +206,8 @@ class WebsocketManager(threading.Thread):
                 logging.error(
                     f"{self.log_prefix} Pong timeout - no response for {time_since_pong:.1f}s; closing socket"
                 )
-                self.ws.close()  # trigger reconnection via run()
+                # closing ends run_forever, which hands control back to run() to reconnect
+                self.ws.close()
                 continue
 
             # send heartbeat (same payload as immediate heartbeat)
@@ -220,13 +215,13 @@ class WebsocketManager(threading.Thread):
 
         logging.info(f"{self.log_prefix} Websocket ping thread stopped")
 
-    def stop(self):
+    def stop(self) -> None:
         self.stop_event.set()
         self.ws.close()
         if self.ping_sender is not None and self.ping_sender.is_alive():
             self.ping_sender.join()
 
-    def on_message(self, _ws, message):
+    def on_message(self, _ws: websocket.WebSocket, message: str) -> None:
         if message == "Websocket connection established.":
             logging.debug(message)
             return
@@ -235,8 +230,8 @@ class WebsocketManager(threading.Thread):
 
         # check channel directly for proper type narrowing
         if ws_msg["channel"] == "error":
-            logging.error(f"Websocket received error message, stopping websocket: {ws_msg['data']}")
-            self.stop()
+            # server errors are scoped to one request (e.g. a rejected subscription), so keep the other streams alive
+            logging.error(f"{self.log_prefix} Websocket received error message: {ws_msg['data']}")
             return
 
         if ws_msg["channel"] == "subscriptionResponse":
@@ -246,7 +241,7 @@ class WebsocketManager(threading.Thread):
         # get identifier for remaining message types
         identifier = ws_msg_to_identifier(ws_msg)
         if identifier == "pong":
-            self.last_pong_time = time.time()  # update pong timestamp
+            self.last_pong_time = time.time()
             logging.debug("Websocket received pong")
             return
 
@@ -261,50 +256,35 @@ class WebsocketManager(threading.Thread):
             for active_subscription in active_subscriptions:
                 active_subscription.callback(ws_msg)
 
-    def on_open(self, _ws):
+    def on_open(self, _ws: websocket.WebSocket) -> None:
         self.connection_epoch += 1
-        logging.info(f"{self.log_prefix} on_open")
-        self.ws_ready = True
-        self.last_pong_time = time.time()  # reset pong timer on new connection
-        if self.ping_sender is None or not self.ping_sender.is_alive():
-            self._start_ping_thread()
-            logging.info(f"{self.log_prefix} Restarted ping thread after reconnect")
+        logging.info(f"{self.log_prefix} Websocket opened")
+        # a fresh connection has no pong history, so restart the timeout window
+        self.last_pong_time = time.time()
 
         # send an immediate heartbeat on every successful open/reconnect
         self._send_heartbeat_once(context="on_open")
 
-        # on reconnection, restore active subscriptions
         if self.reconnect_attempts > 0:
             logging.info(f"{self.log_prefix} Reconnected successfully after {self.reconnect_attempts} attempts")
-
-            # collect all active subscriptions to restore
-            subscriptions_to_restore = []
-
-            # save current active subscriptions and clear them
-            temp_active_subs = dict(self.active_subscriptions)
-            self.active_subscriptions.clear()
-
-            # re-subscribe to all previously active subscriptions
-            for identifier, active_subs in temp_active_subs.items():
-                for active_sub in active_subs:
-                    subscriptions_to_restore.append(active_sub)
-
-            # restore all subscriptions
-            for active_sub in subscriptions_to_restore:
-                self.subscribe(active_sub.subscription, active_sub.callback, active_sub.subscription_id)
-
-            logging.info(f"{self.log_prefix} Restored {len(subscriptions_to_restore)} subscriptions after reconnection")
-
-        # reset reconnection counter on successful connection
         self.reconnect_attempts = 0
 
-        # process queued subscriptions (for initial connection or new subscriptions during disconnect)
-        for subscription, active_subscription in self.queued_subscriptions:
-            self.subscribe(subscription, active_subscription.callback, active_subscription.subscription_id)
+        with self.subscriptions_lock:
+            for active_subscription in self.queued_subscriptions:
+                identifier = subscription_to_identifier(active_subscription.subscription)
+                self.active_subscriptions[identifier].append(active_subscription)
+            self.queued_subscriptions.clear()
+            # the server dropped every subscription with the old socket, so replay one frame per identifier;
+            # state is merged before sending so a send failing mid-replay loses nothing for the next reconnect
+            replayed_subscriptions = [subs[0].subscription for subs in self.active_subscriptions.values() if subs]
+            for subscription in replayed_subscriptions:
+                self._send_subscribe(subscription)
+            # mark ready only after replaying, so a concurrent subscribe cannot interleave a duplicate frame
+            self.ws_ready = True
 
-        self.queued_subscriptions.clear()
+        logging.info(f"{self.log_prefix} Replayed {len(replayed_subscriptions)} subscriptions on open")
 
-    def _start_ping_thread(self):
+    def _start_ping_thread(self) -> None:
         if self.ping_sender is not None and self.ping_sender.is_alive():
             return
         self.ping_sender = threading.Thread(target=self.send_ping, name="HyperliquidPing", daemon=True)
@@ -313,32 +293,56 @@ class WebsocketManager(threading.Thread):
     def subscribe(
         self, subscription: Subscription, callback: Callable[[Any], None], subscription_id: Optional[int] = None
     ) -> int:
-        if subscription_id is None:
-            self.subscription_id_counter += 1
-            subscription_id = self.subscription_id_counter
-        if not self.ws_ready:
-            logging.debug("enqueueing subscription")
-            self.queued_subscriptions.append(
-                (subscription, ActiveSubscription(callback, subscription_id, subscription))
-            )
-        else:
-            logging.debug("subscribing")
-            identifier = subscription_to_identifier(subscription)
+        identifier = subscription_to_identifier(subscription)
+        with self.subscriptions_lock:
             if identifier == "userEvents" or identifier == "orderUpdates":
                 # TODO: ideally the userEvent and orderUpdates messages would include the user so that we can multiplex
-                if len(self.active_subscriptions[identifier]) != 0:
+                # checked against queued ones too, so on_open replays only admitted subscriptions and cannot raise
+                is_queued = any(
+                    subscription_to_identifier(queued.subscription) == identifier
+                    for queued in self.queued_subscriptions
+                )
+                if self.active_subscriptions[identifier] or is_queued:
                     raise NotImplementedError(f"Cannot subscribe to {identifier} multiple times")
-            self.active_subscriptions[identifier].append(ActiveSubscription(callback, subscription_id, subscription))
-            self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
+            if subscription_id is None:
+                self.subscription_id_counter += 1
+                subscription_id = self.subscription_id_counter
+            active_subscription = ActiveSubscription(callback, subscription_id, subscription)
+            if not self.ws_ready:
+                logging.debug("enqueueing subscription")
+                self.queued_subscriptions.append(active_subscription)
+                return subscription_id
+
+            logging.debug("subscribing")
+            is_first_for_identifier = not self.active_subscriptions[identifier]
+            self.active_subscriptions[identifier].append(active_subscription)
+            # the server rejects a repeated subscribe to the same channel, so extra callbacks fan out locally
+            if is_first_for_identifier:
+                self._send_or_defer_to_replay({"method": "subscribe", "subscription": subscription})
         return subscription_id
 
+    def _send_subscribe(self, subscription: Subscription) -> None:
+        self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
+
+    def _send_or_defer_to_replay(self, payload: Dict[str, Any]) -> None:
+        # callers hold subscriptions_lock and have already recorded the state change. a socket can drop before
+        # on_close clears ws_ready, so a failed send marks it not ready and leaves the change to on_open's replay
+        try:
+            self.ws.send(json.dumps(payload))
+        except (websocket.WebSocketConnectionClosedException, OSError):
+            logging.exception(f"{self.log_prefix} Send failed on a dropped socket, deferring to replay on reconnect")
+            self.ws_ready = False
+
     def unsubscribe(self, subscription: Subscription, subscription_id: int) -> bool:
-        if not self.ws_ready:
-            raise NotImplementedError("Can't unsubscribe before websocket connected")
         identifier = subscription_to_identifier(subscription)
-        active_subscriptions = self.active_subscriptions[identifier]
-        new_active_subscriptions = [x for x in active_subscriptions if x.subscription_id != subscription_id]
-        if len(new_active_subscriptions) == 0:
-            self.ws.send(json.dumps({"method": "unsubscribe", "subscription": subscription}))
-        self.active_subscriptions[identifier] = new_active_subscriptions
-        return len(active_subscriptions) != len(new_active_subscriptions)
+        with self.subscriptions_lock:
+            queued_count = len(self.queued_subscriptions)
+            self.queued_subscriptions = [x for x in self.queued_subscriptions if x.subscription_id != subscription_id]
+            active_subscriptions = self.active_subscriptions[identifier]
+            new_active_subscriptions = [x for x in active_subscriptions if x.subscription_id != subscription_id]
+            self.active_subscriptions[identifier] = new_active_subscriptions
+            is_active_removed = len(active_subscriptions) != len(new_active_subscriptions)
+            # while disconnected the server holds no subscription to drop, and on_open replays only what remains
+            if self.ws_ready and is_active_removed and not new_active_subscriptions:
+                self._send_or_defer_to_replay({"method": "unsubscribe", "subscription": subscription})
+            return is_active_removed or len(self.queued_subscriptions) != queued_count
