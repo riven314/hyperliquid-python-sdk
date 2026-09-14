@@ -12,6 +12,7 @@ def main():
     info.subscribe({"type": "trades", "coin": "PURR/USDC"}, print)
     info.subscribe({"type": "userEvents", "user": address}, print)
     info.subscribe({"type": "userFills", "user": address}, print)
+    info.subscribe({"type": "userTwapSliceFills", "user": address}, print)
     info.subscribe({"type": "candle", "coin": "ETH", "interval": "1m"}, print)
     info.subscribe({"type": "orderUpdates", "user": address}, print)
     info.subscribe({"type": "userFundings", "user": address}, print)
