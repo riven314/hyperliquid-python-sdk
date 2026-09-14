@@ -268,17 +268,19 @@ class WebsocketManager(threading.Thread):  # pylint: disable=too-many-instance-a
         self.reconnect_attempts = 0
 
         with self.subscriptions_lock:
-            # the server dropped active subscriptions with the old socket, so replay them along with queued ones
-            pending_subscriptions = [sub for subs in self.active_subscriptions.values() for sub in subs]
-            pending_subscriptions.extend(self.queued_subscriptions)
-            self.active_subscriptions.clear()
+            for active_subscription in self.queued_subscriptions:
+                identifier = subscription_to_identifier(active_subscription.subscription)
+                self.active_subscriptions[identifier].append(active_subscription)
             self.queued_subscriptions.clear()
-            for active_subscription in pending_subscriptions:
-                self._activate_subscription(active_subscription)
+            # the server dropped every subscription with the old socket, so replay one frame per identifier;
+            # state is merged before sending so a send failing mid-replay loses nothing for the next reconnect
+            replayed_subscriptions = [subs[0].subscription for subs in self.active_subscriptions.values() if subs]
+            for subscription in replayed_subscriptions:
+                self._send_subscribe(subscription)
             # mark ready only after replaying, so a concurrent subscribe cannot interleave a duplicate frame
             self.ws_ready = True
 
-        logging.info(f"{self.log_prefix} Subscribed {len(pending_subscriptions)} pending subscriptions on open")
+        logging.info(f"{self.log_prefix} Replayed {len(replayed_subscriptions)} subscriptions on open")
 
     def _start_ping_thread(self) -> None:
         if self.ping_sender is not None and self.ping_sender.is_alive():
@@ -289,7 +291,17 @@ class WebsocketManager(threading.Thread):  # pylint: disable=too-many-instance-a
     def subscribe(
         self, subscription: Subscription, callback: Callable[[Any], None], subscription_id: Optional[int] = None
     ) -> int:
+        identifier = subscription_to_identifier(subscription)
         with self.subscriptions_lock:
+            if identifier == "userEvents" or identifier == "orderUpdates":
+                # TODO: ideally the userEvent and orderUpdates messages would include the user so that we can multiplex
+                # checked against queued ones too, so on_open replays only admitted subscriptions and cannot raise
+                is_queued = any(
+                    subscription_to_identifier(queued.subscription) == identifier
+                    for queued in self.queued_subscriptions
+                )
+                if self.active_subscriptions[identifier] or is_queued:
+                    raise NotImplementedError(f"Cannot subscribe to {identifier} multiple times")
             if subscription_id is None:
                 self.subscription_id_counter += 1
                 subscription_id = self.subscription_id_counter
@@ -297,31 +309,29 @@ class WebsocketManager(threading.Thread):  # pylint: disable=too-many-instance-a
             if not self.ws_ready:
                 logging.debug("enqueueing subscription")
                 self.queued_subscriptions.append(active_subscription)
-            else:
-                logging.debug("subscribing")
-                self._activate_subscription(active_subscription)
+                return subscription_id
+
+            logging.debug("subscribing")
+            is_first_for_identifier = not self.active_subscriptions[identifier]
+            self.active_subscriptions[identifier].append(active_subscription)
+            # the server rejects a repeated subscribe to the same channel, so extra callbacks fan out locally
+            if is_first_for_identifier:
+                self._send_subscribe(subscription)
         return subscription_id
 
-    def _activate_subscription(self, active_subscription: ActiveSubscription) -> None:
-        identifier = subscription_to_identifier(active_subscription.subscription)
-        if identifier == "userEvents" or identifier == "orderUpdates":
-            # TODO: ideally the userEvent and orderUpdates messages would include the user so that we can multiplex
-            if len(self.active_subscriptions[identifier]) != 0:
-                raise NotImplementedError(f"Cannot subscribe to {identifier} multiple times")
-        is_first_for_identifier = len(self.active_subscriptions[identifier]) == 0
-        self.active_subscriptions[identifier].append(active_subscription)
-        # the server rejects a repeated subscribe to the same channel, so extra callbacks fan out locally
-        if is_first_for_identifier:
-            self.ws.send(json.dumps({"method": "subscribe", "subscription": active_subscription.subscription}))
+    def _send_subscribe(self, subscription: Subscription) -> None:
+        self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
 
     def unsubscribe(self, subscription: Subscription, subscription_id: int) -> bool:
+        identifier = subscription_to_identifier(subscription)
         with self.subscriptions_lock:
-            if not self.ws_ready:
-                raise NotImplementedError("Can't unsubscribe before websocket connected")
-            identifier = subscription_to_identifier(subscription)
+            queued_count = len(self.queued_subscriptions)
+            self.queued_subscriptions = [x for x in self.queued_subscriptions if x.subscription_id != subscription_id]
             active_subscriptions = self.active_subscriptions[identifier]
             new_active_subscriptions = [x for x in active_subscriptions if x.subscription_id != subscription_id]
-            if len(new_active_subscriptions) == 0:
-                self.ws.send(json.dumps({"method": "unsubscribe", "subscription": subscription}))
             self.active_subscriptions[identifier] = new_active_subscriptions
-            return len(active_subscriptions) != len(new_active_subscriptions)
+            is_active_removed = len(active_subscriptions) != len(new_active_subscriptions)
+            # while disconnected the server holds no subscription to drop, and on_open replays only what remains
+            if self.ws_ready and is_active_removed and not new_active_subscriptions:
+                self.ws.send(json.dumps({"method": "unsubscribe", "subscription": subscription}))
+            return is_active_removed or len(self.queued_subscriptions) != queued_count
