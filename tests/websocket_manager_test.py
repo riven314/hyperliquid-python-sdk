@@ -1,7 +1,9 @@
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
+import websocket
 
 from hyperliquid.utils.types import Fill, Subscription
 from hyperliquid.websocket_manager import WebsocketManager, subscription_to_identifier, ws_msg_to_identifier
@@ -112,6 +114,30 @@ def test_subscribe_rejects_second_unmultiplexed_subscription_before_open(subscri
     manager.on_open(ws)
     assert get_sent_subscriptions(ws) == [subscription]
     assert manager.ws_ready
+
+
+def test_subscribe_on_dropped_socket_defers_to_replay_on_open():
+    manager, ws = get_connected_manager()
+    ws.send.side_effect = websocket.WebSocketConnectionClosedException("Connection is already closed.")
+
+    manager.subscribe(FILLS_SUBSCRIPTION, MagicMock())
+
+    assert not manager.ws_ready
+    ws.send.side_effect = None
+    ws.send.reset_mock()
+    manager.on_open(ws)
+    assert get_sent_subscriptions(ws) == [FILLS_SUBSCRIPTION]
+    assert manager.ws_ready
+
+
+def test_run_restarts_pong_window_before_connecting():
+    manager, ws = get_connected_manager()
+    manager.last_pong_time = 0.0
+    ws.run_forever.side_effect = manager.stop_event.set
+
+    manager.run()
+
+    assert time.time() - manager.last_pong_time < manager.heartbeat_interval
 
 
 def test_error_message_keeps_websocket_running():

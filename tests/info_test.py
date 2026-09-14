@@ -1,10 +1,40 @@
 import pytest
 
 from hyperliquid.info import Info
-from hyperliquid.utils.types import L2BookData, Meta, SpotMeta
+from hyperliquid.utils.types import L2BookData, Meta, SpotMeta, SpotTokenInfo
 
 TEST_META: Meta = {"universe": []}
 TEST_SPOT_META: SpotMeta = {"universe": [], "tokens": []}
+
+
+def get_spot_token(name: str, index: int, sz_decimals: int) -> SpotTokenInfo:
+    return {
+        "name": name,
+        "szDecimals": sz_decimals,
+        "weiDecimals": 8,
+        "index": index,
+        "tokenId": "0x0",
+        "isCanonical": False,
+        "evmContract": None,
+        "fullName": None,
+    }
+
+
+def test_spot_assets_resolve_tokens_by_index_not_list_position():
+    # the tokens list has gaps, so token index 478 sits at list position 1
+    spot_meta: SpotMeta = {
+        "universe": [
+            {"name": "@590", "tokens": [478, 0], "index": 590, "isCanonical": False},
+            {"name": "@999", "tokens": [999, 0], "index": 999, "isCanonical": False},
+        ],
+        "tokens": [get_spot_token("USDC", 0, 8), get_spot_token("SPCX", 478, 4)],
+    }
+
+    info = Info(skip_ws=True, meta=TEST_META, spot_meta=spot_meta)
+
+    assert info.name_to_coin["SPCX/USDC"] == "@590"
+    assert info.asset_to_sz_decimals[10590] == 4
+    assert "@999" not in info.coin_to_asset
 
 
 @pytest.mark.vcr()
