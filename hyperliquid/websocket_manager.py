@@ -51,11 +51,7 @@ def subscription_to_identifier(subscription: Subscription) -> str:
 
 
 def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
-    if ws_msg["channel"] == "subscriptionResponse":
-        return "subscriptionResponse"
-    elif ws_msg["channel"] == "error":
-        return "error"
-    elif ws_msg["channel"] == "pong":
+    if ws_msg["channel"] == "pong":
         return "pong"
     elif ws_msg["channel"] == "allMids":
         return "allMids"
@@ -89,6 +85,7 @@ def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
         return f'activeAssetCtx:{ws_msg["data"]["coin"].lower()}'
     elif ws_msg["channel"] == "activeAssetData":
         return f'activeAssetData:{ws_msg["data"]["coin"].lower()},{ws_msg["data"]["user"].lower()}'
+    return None
 
 
 class WebsocketManager(threading.Thread):
@@ -170,42 +167,27 @@ class WebsocketManager(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 self.ws.run_forever()
-
-                # connection closed - check if we should reconnect
-                if self.stop_event.is_set() or not self.reconnect_enabled:
-                    break
-
-                # calculate exponential backoff delay, apply full jitter to de-synchronize retries
-                base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
-                delay = random.uniform(0.0, base_delay)
-                self.reconnect_attempts += 1
-
-                logging.info(
-                    f"{self.log_prefix} Reconnecting in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
-                )
-
-                # wait with backoff (interruptible by stop_event)
-                if self.stop_event.wait(delay):
-                    break
-
-                # loop continues, ws.run_forever() will reconnect
-
             except Exception as e:
                 logging.error(f"{self.log_prefix} WebSocket unexpected error: {e}")
-                if not self.stop_event.is_set() and self.reconnect_enabled:
-                    # calculate exponential backoff delay, apply full jitter to de-synchronize retries
-                    base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
-                    delay = random.uniform(0.0, base_delay)
-                    self.reconnect_attempts += 1
 
-                    logging.info(
-                        f"{self.log_prefix} Reconnecting after error in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
-                    )
-
-                    if self.stop_event.wait(delay):
-                        break
-                    continue
+            if self.stop_event.is_set() or not self.reconnect_enabled:
                 break
+            if self._wait_before_reconnect():
+                break
+
+    def _wait_before_reconnect(self) -> bool:
+        """
+        Sleeps with exponential backoff and full jitter, returning True if stop was requested meanwhile.
+
+        e.g. max_reconnect_delay=30: attempt 0 waits U(0, 1)s, attempt 3 waits U(0, 8)s, attempt 5+ waits U(0, 30)s.
+        """
+        base_delay = min(2**self.reconnect_attempts, self.max_reconnect_delay)
+        delay = random.uniform(0.0, base_delay)
+        self.reconnect_attempts += 1
+        logging.info(
+            f"{self.log_prefix} Reconnecting in {delay:.2f}s (attempt {self.reconnect_attempts}, base_delay={base_delay}s, jitter=full)..."
+        )
+        return self.stop_event.wait(delay)
 
     def send_ping(self):
         logging.info(f"{self.log_prefix} Websocket ping loop running interval={self.heartbeat_interval}s")
@@ -272,9 +254,6 @@ class WebsocketManager(threading.Thread):
         self.connection_epoch += 1
         logging.info(f"{self.log_prefix} on_open")
         self.last_pong_time = time.time()  # reset pong timer on new connection
-        if self.ping_sender is None or not self.ping_sender.is_alive():
-            self._start_ping_thread()
-            logging.info(f"{self.log_prefix} Restarted ping thread after reconnect")
 
         # send an immediate heartbeat on every successful open/reconnect
         self._send_heartbeat_once(context="on_open")
