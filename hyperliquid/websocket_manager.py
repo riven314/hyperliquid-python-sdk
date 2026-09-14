@@ -30,6 +30,8 @@ def subscription_to_identifier(subscription: Subscription) -> str:
         return "userEvents"
     elif subscription["type"] == "userFills":
         return f'userFills:{subscription["user"].lower()}'
+    elif subscription["type"] == "userTwapSliceFills":
+        return f'userTwapSliceFills:{subscription["user"].lower()}'
     elif subscription["type"] == "candle":
         return f'candle:{subscription["coin"].lower()},{subscription["interval"]}'
     elif subscription["type"] == "orderUpdates":
@@ -69,6 +71,8 @@ def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
         return "userEvents"
     elif ws_msg["channel"] == "userFills":
         return f'userFills:{ws_msg["data"]["user"].lower()}'
+    elif ws_msg["channel"] == "userTwapSliceFills":
+        return f'userTwapSliceFills:{ws_msg["data"]["user"].lower()}'
     elif ws_msg["channel"] == "candle":
         return f'candle:{ws_msg["data"]["s"].lower()},{ws_msg["data"]["i"]}'
     elif ws_msg["channel"] == "orderUpdates":

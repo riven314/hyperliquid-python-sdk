@@ -42,6 +42,9 @@ L2BookSubscription = TypedDict("L2BookSubscription", {"type": Literal["l2Book"],
 TradesSubscription = TypedDict("TradesSubscription", {"type": Literal["trades"], "coin": str})
 UserEventsSubscription = TypedDict("UserEventsSubscription", {"type": Literal["userEvents"], "user": str})
 UserFillsSubscription = TypedDict("UserFillsSubscription", {"type": Literal["userFills"], "user": str})
+UserTwapSliceFillsSubscription = TypedDict(
+    "UserTwapSliceFillsSubscription", {"type": Literal["userTwapSliceFills"], "user": str}
+)
 CandleSubscription = TypedDict("CandleSubscription", {"type": Literal["candle"], "coin": str, "interval": str})
 OrderUpdatesSubscription = TypedDict("OrderUpdatesSubscription", {"type": Literal["orderUpdates"], "user": str})
 UserFundingsSubscription = TypedDict("UserFundingsSubscription", {"type": Literal["userFundings"], "user": str})
@@ -61,6 +64,7 @@ Subscription = Union[
     TradesSubscription,
     UserEventsSubscription,
     UserFillsSubscription,
+    UserTwapSliceFillsSubscription,
     CandleSubscription,
     OrderUpdatesSubscription,
     UserFundingsSubscription,
@@ -153,7 +157,17 @@ UserEventsData = TypedDict("UserEventsData", {"fills": List[Fill]}, total=False)
 UserEventsMsg = TypedDict("UserEventsMsg", {"channel": Literal["user"], "data": UserEventsData})
 UserFillsData = TypedDict("UserFillsData", {"user": str, "isSnapshot": bool, "fills": List[Fill]})
 UserFillsMsg = TypedDict("UserFillsMsg", {"channel": Literal["userFills"], "data": UserFillsData})
-SubscriptionResponseMsg = TypedDict("SubscriptionResponseMsg", {"channel": Literal["subscriptionResponse"], "data": Any})
+TwapSliceFill = TypedDict("TwapSliceFill", {"fill": Fill, "twapId": int})
+UserTwapSliceFillsData = TypedDict(
+    "UserTwapSliceFillsData",
+    {"user": str, "isSnapshot": NotRequired[bool], "twapSliceFills": List[TwapSliceFill]},
+)
+UserTwapSliceFillsMsg = TypedDict(
+    "UserTwapSliceFillsMsg", {"channel": Literal["userTwapSliceFills"], "data": UserTwapSliceFillsData}
+)
+SubscriptionResponseMsg = TypedDict(
+    "SubscriptionResponseMsg", {"channel": Literal["subscriptionResponse"], "data": Any}
+)
 ErrorMsg = TypedDict("ErrorMsg", {"channel": Literal["error"], "data": str})
 OtherWsMsg = TypedDict(
     "OtherWsMsg",
@@ -177,6 +191,7 @@ WsMsg = Union[
     UserEventsMsg,
     PongMsg,
     UserFillsMsg,
+    UserTwapSliceFillsMsg,
     SubscriptionResponseMsg,
     ErrorMsg,
     OtherWsMsg,
