@@ -168,6 +168,8 @@ class WebsocketManager(threading.Thread):  # pylint: disable=too-many-instance-a
         self._start_ping_thread()
 
         while not self.stop_event.is_set():
+            # restart the pong window per attempt, else a stale one lets the ping thread close the socket mid-handshake
+            self.last_pong_time = time.time()
             try:
                 self.ws.run_forever()
             except Exception:  # pylint: disable=broad-exception-caught
@@ -316,11 +318,20 @@ class WebsocketManager(threading.Thread):  # pylint: disable=too-many-instance-a
             self.active_subscriptions[identifier].append(active_subscription)
             # the server rejects a repeated subscribe to the same channel, so extra callbacks fan out locally
             if is_first_for_identifier:
-                self._send_subscribe(subscription)
+                self._send_or_defer_to_replay({"method": "subscribe", "subscription": subscription})
         return subscription_id
 
     def _send_subscribe(self, subscription: Subscription) -> None:
         self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
+
+    def _send_or_defer_to_replay(self, payload: Dict[str, Any]) -> None:
+        # callers hold subscriptions_lock and have already recorded the state change. a socket can drop before
+        # on_close clears ws_ready, so a failed send marks it not ready and leaves the change to on_open's replay
+        try:
+            self.ws.send(json.dumps(payload))
+        except (websocket.WebSocketConnectionClosedException, OSError):
+            logging.exception(f"{self.log_prefix} Send failed on a dropped socket, deferring to replay on reconnect")
+            self.ws_ready = False
 
     def unsubscribe(self, subscription: Subscription, subscription_id: int) -> bool:
         identifier = subscription_to_identifier(subscription)
@@ -333,5 +344,5 @@ class WebsocketManager(threading.Thread):  # pylint: disable=too-many-instance-a
             is_active_removed = len(active_subscriptions) != len(new_active_subscriptions)
             # while disconnected the server holds no subscription to drop, and on_open replays only what remains
             if self.ws_ready and is_active_removed and not new_active_subscriptions:
-                self.ws.send(json.dumps({"method": "unsubscribe", "subscription": subscription}))
+                self._send_or_defer_to_replay({"method": "unsubscribe", "subscription": subscription})
             return is_active_removed or len(self.queued_subscriptions) != queued_count
